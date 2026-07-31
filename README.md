@@ -110,7 +110,7 @@ uv pip install flash_attn==2.7.4.post1 --no-build-isolation
 git submodule update --init --recursive
 GIT_LFS_SKIP_SMUDGE=1 uv sync --all-groups --index-strategy unsafe-best-match --active
 uv pip install flash_attn==2.7.4.post1 --no-build-isolation
-UV_PROJECT_ENVIRONMENT=${pwd}/.venv-psi ./scripts/install_curobo.sh
+UV_PROJECT_ENVIRONMENT=${pwd}/.venv-psi ./thrid_party/SIMPLE/scripts/install_curobo.sh
 ```
 
 Test installation, a version number should be displayed.
