@@ -1,175 +1,399 @@
 # Psi0 + SONIC Real-Robot Emergency Stop Design
 
-**Status:** Approved design, pending implementation plan
+**Status:** REVISED — BLOCKED pending independent approval and the prerequisites listed below
 **Date:** 2026-08-26
-**Scope:** Safe termination of the local GEAR-SONIC deployment process before Psi0 real-robot testing
+**Scope:** Safe stop of the pinned GEAR-SONIC v1.1 controller before any Psi0 real-robot action publication
 
-## Context
+This revision withdraws the earlier approval claim. It is a design for review, not authorization to implement or actuate a real robot.
 
-Psi0 real-robot inference depends on the official GEAR-SONIC v1.1 C++ controller. The controller already supports an `O`/`o` emergency-stop key. That path sets `operator_state.stop`, leaves the main loop, joins the control threads, and publishes one zero-torque, damping-only command before exit.
+## Review Basis
 
-Raw process termination is not equivalent. The current `G1Deploy` destructor is empty and the non-ROS2 manager path has no `SIGINT` or `SIGTERM` handler. Abruptly terminating `g1_deploy_onnx_ref` can therefore bypass the controller's `Stop()` cleanup. `SIGKILL` can never be handled and must not be an automated software stop mechanism.
+The earlier design incorrectly treated entry into `G1Deploy::Stop()` as timely damping. Direct review of NVlabs GR00T-WholeBodyControl revision `c374bae5b9039cd0ee71377e654d11ce1bc69e1d` shows:
 
-The validated workspace also contains an official NVlabs GR00T-WholeBodyControl submodule pinned to revision `c374bae5b9039cd0ee71377e654d11ce1bc69e1d` plus a version-specific ZMQ manager compatibility patch. The implementation must preserve that exact controller baseline rather than silently replacing it with another revision.
+- `LowCommandWriter()` publishes the latest buffered body command at 500 Hz and also republishes the latest Dex3 hand commands.
+- `Stop()` sets a plain `bool`, joins input, control, writer, and planner threads, and only then creates and publishes one body damping command.
+- the ZMQ manager has stop-unaware planner-initialization waits lasting up to five seconds;
+- policy and planner inference may also delay thread exit;
+- `OperatorState::stop`, `start`, and `play` are plain booleans shared across threads; and
+- `[DEBUG] Stopping G1Deploy...` is printed before `Stop()` and therefore proves only that shutdown was requested.
+
+The existing `Stop` text proves that a host-side DDS `Write()` call returned. It does not prove that the G1 received or applied damping. Only the hardware E-stop is independent of the controller process, host, DDS path, and robot network.
+
+## Safety Claims and Non-Claims
+
+The design may claim only the following, with the stated evidence:
+
+| Claim | Required evidence |
+|---|---|
+| shutdown requested | run-bound controller event |
+| body/hand safe command latched | run-bound writer event after the latch becomes irreversible |
+| safe command published by host | successful local DDS write plus exact serialized command fields |
+| safe command observed in MuJoCo | independent `rt/lowcmd` and hand-topic subscribers see the required fields |
+| controller exited gracefully | valid lifecycle history, required stop evidence for the environment, and pidfd-reported exit |
+| robot applied damping | **not available from the current protocol** |
+
+No log line, PID disappearance, DDS return value, camera observation, or MuJoCo result is described as actuator-side acknowledgement on real hardware.
 
 ## Goals
 
-- Provide one operator command that stops only the intended GEAR-SONIC deployment.
-- Make `O`, `Ctrl+C`, `SIGINT`, and `SIGTERM` converge on the existing graceful `Stop()` path.
-- Preserve the damping-only final command and orderly thread shutdown.
-- Give the operator positive evidence that graceful shutdown completed.
-- Prove the mechanism during active MuJoCo control before any real G1 command.
-- Require a successful stop rehearsal on real hardware before enabling Psi0 action publication.
+- Make every controller stop source latch a safe command in the 500 Hz writer before teardown waits.
+- Ensure control, initialization, planner, and hand paths cannot overwrite or bypass the latch.
+- Remove data races from shared lifecycle and operator state.
+- Target the exact launched controller through a supervisor-owned Linux pidfd.
+- Produce run-bound, structured evidence instead of searching unscoped logs.
+- Verify the actual body and hand command contents and latency in MuJoCo.
+- Fail closed across concurrent requests, startup races, abnormal exits, and stale state.
+- Make the standard Psi0 real client launcher refuse to proceed without an exact, manually signed rehearsal receipt.
 
 ## Non-Goals
 
 - This is not a replacement for the Unitree hardware E-stop.
-- This does not add shadow mode or a runtime shadow/live toggle.
-- This does not automatically use `SIGKILL`.
-- This does not redesign SONIC control, Psi0 inference, action limits, or fall detection.
-- This does not terminate unrelated simulator, camera, training, Docker, or SSH processes.
+- The software paths are not independent safety fault domains.
+- This does not add shadow mode.
+- This does not automatically use `SIGKILL`, `pkill`, `killall`, name matching, or process-group signalling.
+- This does not claim robot-side damping acknowledgement.
+- This does not approve real-robot testing while any blocking prerequisite remains.
 
-## Selected Approach
+## Safety Timing Contract
 
-Use three independent layers:
+The relevant timestamps use `CLOCK_MONOTONIC_RAW` from the controller or the closest available monotonic clock:
 
-1. **Native controller stop:** Keep `O`/`o` as the primary stop because it already reaches `G1Deploy::Stop()`.
-2. **Signal bridge:** Patch the pinned controller so `SIGINT` and `SIGTERM` assign a `volatile std::sig_atomic_t` shutdown flag. The normal main loop observes the flag, sets `operator_state.stop`, and then calls `G1Deploy::Stop()` from ordinary program context.
-3. **Exact-process supervisor:** Launch the controller in a dedicated tmux session and record its session name, PID, process start time, command identity, and log path. A stop script validates this identity before sending any input or signal.
+- `t_request`: the first accepted stop request;
+- `t_latched`: the irreversible writer latch is set;
+- `t_body_publish`: the first complete body damping DDS write returns;
+- `t_hand_publish`: both first hand-relax DDS writes return; and
+- `t_sim_observed`: an independent MuJoCo-side observer receives all three safe commands.
 
-The Unitree hardware E-stop remains the independent final layer for controller hangs, host failures, or network failures.
+The controller publishes at 500 Hz, so one writer period is 2 ms. The design target is two periods and the hard host-side ceiling is five periods:
 
-## Components
+- target `max(t_body_publish, t_hand_publish) - t_request <= 4 ms`;
+- hard failure at `max(t_body_publish, t_hand_publish) - t_request > 10 ms`; and
+- MuJoCo hard failure at `t_sim_observed - t_request > 20 ms`.
 
-### Version-Pinned Controller Patch
+These are software containment limits: at most five 500 Hz periods before the host has published safe commands. They are not a robot braking-time claim. Before any real launch, the named robot safety owner must record an approved `max_request_to_host_publish_ms` no greater than 10 ms in the rehearsal policy. There is no permissive real-hardware default. If the hardware risk assessment requires a lower value, that lower value becomes the test threshold and receipt field.
 
-Add a second patch alongside the existing ZMQ manager compatibility patch. The setup script applies both patches only when the GR00T-WBC submodule is at the validated revision.
+The old 500 ms and five-second intervals are removed from the safety path. Process teardown may take longer, but safe-command publication must continue while teardown is blocked. A hung writer or DDS call is a software-stop failure requiring the hardware E-stop.
 
-The C++ patch will:
+## Controller Safety Kernel
 
-- install handlers for `SIGINT` and `SIGTERM`;
-- have each handler perform only an assignment to `volatile std::sig_atomic_t`;
-- check the flag in the existing main loop;
-- set `operator_state.stop` from normal program context;
-- preserve the single existing call to `custom.Stop()` and its damping command;
-- log the received signal and the completion of graceful shutdown.
+### Single synchronized shutdown state
 
-The signal handler will not call `Stop()`, DDS, CUDA, I/O, locks, or allocation directly.
+Introduce one controller-owned `ShutdownCoordinator` with an atomic, monotonic phase and a first-writer-wins reason:
 
-### Dedicated Launch Supervisor
+```text
+STARTING -> RUNNING -> STOP_REQUESTED -> DAMPING_LATCHED -> TEARDOWN
+```
 
-The real deployment launcher will run in a uniquely named tmux session. It will write a manifest under a runtime directory containing:
+No transition may move backward. `RequestShutdown(reason)` is idempotent and records every repeated request without changing the original `t_request` or reason. All current assignments to `operator_state.stop` are replaced by this API. The main, input, control, planner, and writer threads read the coordinator with acquire semantics.
 
-- schema/version;
-- tmux session and pane;
-- shell PID and resolved `g1_deploy_onnx_ref` PID;
-- `/proc/<pid>/stat` start time to prevent PID-reuse mistakes;
-- resolved executable path and command line;
-- environment mode (`sim` or `real`);
-- log path and launch timestamp.
+`OperatorState::start` and `OperatorState::play` are also synchronized through atomic fields or a locked snapshot API. Merely making `stop` volatile is forbidden. Tests must run a thread sanitizer build of the coordinator and input/control interaction where supported.
 
-The launcher must refuse to overwrite a manifest for a still-running matching process. A stale manifest may be replaced only after identity validation proves the old process is gone.
+### Signal handling before actuation
 
-### Emergency-Stop Command
+`sigaction` handlers for `SIGINT` and `SIGTERM` are installed before constructing `G1Deploy` or starting any controller thread. The handler performs only one async-signal-safe assignment to a `volatile std::sig_atomic_t` request flag.
 
-Provide a single top-level command for the operator. It follows this state machine:
+The writer examines that flag before every publish and converts it into the same irreversible shutdown latch. The main loop also converts it through `RequestShutdown()` in normal context. This covers a signal that arrives while the constructor is loading models or after writer creation but before the constructor returns.
 
-1. Read the manifest and validate tmux session, PID, start time, executable, and command line.
-2. Send `O` to the recorded tmux pane.
-3. Wait up to 500 ms for the `[DEBUG] Stopping G1Deploy...` marker, which proves the main loop entered normal shutdown.
-4. If that marker is absent, send `SIGINT` to the exact validated controller PID.
-5. Wait up to another 500 ms for the same shutdown-entry marker.
-6. If the marker is still absent, print a loud failure directing immediate use of the hardware E-stop. Return nonzero without automatically sending `SIGKILL`.
-7. Once shutdown entry is confirmed, allow up to 5 seconds for the `Stop` completion marker and exact process exit. A timeout is an abnormal shutdown and again directs use of the hardware E-stop.
+Startup semantics are explicit:
 
-Repeated stop commands are idempotent: an already-stopped deployment reports that state successfully. Missing, malformed, stale, or mismatched manifests fail closed and never fall back to `pkill`, name matching, or broad process searches.
+- signal before any publisher or actuation thread exists: cancel launch and record `damping_required=false`;
+- signal after the publisher exists but before `RUNNING`: latch and publish safe commands before teardown;
+- repeated signals: increment an audit counter but do not re-enter teardown; and
+- signal during teardown: keep the latch set and continue publishing safe commands.
 
-## Shutdown Contract
+`Ctrl+C` is the terminal-generated `SIGINT` case and has its own acceptance test.
 
-A software stop is successful only when all of the following are observed:
+### Writer-level irreversible latch
 
-- the exact controller process has exited;
-- the log contains the graceful shutdown sequence, including the `Stop` marker;
-- no matching child controller process remains in the recorded process group;
-- the stop command returns success and records the stop reason and timestamp.
+The 500 Hz writer is the safety authority. It must not depend on `motor_command_buffer_` after shutdown is requested.
 
-Process disappearance without the graceful marker is reported as an abnormal termination, not a successful safety stop.
+On each tick it:
 
-## Operator Workflow
+1. acquires the publish gate;
+2. observes the signal flag and atomic shutdown phase;
+3. transitions to `DAMPING_LATCHED` if necessary;
+4. constructs safe commands directly, rather than copying a possibly stale buffer;
+5. rechecks the latch immediately before DDS publication; and
+6. publishes only safe commands for the rest of the process lifetime.
 
-### MuJoCo Rehearsal
+The publish gate serializes a normal write already in progress with latch activation. At most one normal DDS write that began before `t_request` may complete afterward. No normal write may begin after `t_latched`.
 
-1. Start MuJoCo and the SONIC v1.1 controller with the supervisor in `sim` mode.
-2. Enable active control and release the robot as in the validated evaluation workflow.
-3. Run the emergency-stop command from a separate terminal.
-4. Confirm the damping shutdown marker, exact process exit, and simulator behavior.
-5. Repeat once using the primary `O` path and once using the signal fallback path.
+The required body command covers all 29 motors:
 
-### Real-Hardware Gate
+```text
+mode = enabled
+tau = 0
+q = 0
+dq = 0
+kp = 0
+kd = 8
+```
 
-1. Confirm gantry/support, a clear 3 m zone, a tested hardware E-stop, and a dedicated operator at the stop terminal.
-2. Start GEAR-SONIC v1.1 without starting the Psi0 client.
-3. Enter the safe initialization/standing state only.
-4. Run the emergency-stop command and confirm graceful damping shutdown.
-5. Restart the controller only after this rehearsal passes.
-6. Connect Psi0 and run the separately approved short, safety-clamped action trial.
+The required Dex3 command covers every motor on both hands and uses the existing timeout/relax semantics:
 
-The Psi0 client is never the only available stop mechanism. The emergency-stop terminal and hardware E-stop remain staffed throughout the trial.
+```text
+timeout bit = 1
+tau = 0
+q = 0
+dq = 0
+kp = 0
+kd = 0
+```
 
-## Error Handling
+Hand relaxation is constructed and published directly on the latched path; it must not pass through normal position clipping or smoothing.
 
-- **tmux unavailable:** refuse supervised real deployment.
-- **Manifest identity mismatch:** refuse to signal any process and request operator inspection.
-- **Graceful marker missing:** treat the stop as failed even if the PID disappears.
-- **Signal fallback fails:** direct immediate use of the hardware E-stop; do not escalate automatically to `SIGKILL`.
-- **Controller crashes:** record abnormal termination and prohibit automatic restart.
-- **Compatibility patch mismatch:** refuse to patch or build against an unvalidated GR00T-WBC revision.
+### Preventing later overwrite
 
-## Testing
+Initialization, policy inference, planner inference, and hand updates use `SetCommandIfRunning(...)`. That API checks the atomic phase before and while committing a buffer update. A command computed before the stop may be discarded afterward, but never committed as a live command after the latch.
 
-### Static and Unit Tests
+The writer-level latch remains authoritative even if a producer check is missed. A long-running inference may finish, but its result cannot reach DDS.
 
-- The official submodule URL and pinned revision are exact.
-- Both compatibility patches apply cleanly and idempotently to the pinned revision.
-- Signal handlers do only flag assignment.
-- The main loop routes signal requests through the normal `Stop()` path.
-- Manifest parsing rejects missing fields, PID reuse, wrong executable paths, wrong command lines, and stale sessions.
-- Stop targeting never uses unscoped `pkill`, `killall`, or name-only matching.
-- Repeated stop requests are safe and idempotent.
+### Stop-aware waits and teardown order
 
-### Integration Tests
+All polling waits in input and planner callbacks become predicate-based waits that return when shutdown is requested. The five-second ZMQ planner waits must not delay callback return. Blocking inference is checked before invocation and after return; it is not treated as interruptible.
 
-- A harmless fixture process in tmux proves exact PID/start-time targeting.
-- Unrelated similarly named processes remain alive.
-- The `O` path exits gracefully and records its marker.
-- Forced primary-path timeout exercises the `SIGINT` fallback and reaches the same marker.
-- A deliberately mismatched manifest sends no signal.
+Teardown order is:
 
-### MuJoCo Acceptance Test
+1. latch safe body and hand publication;
+2. keep the writer running at 500 Hz;
+3. request and join input, control, and planner threads;
+4. complete the environment-specific safe handoff; and
+5. stop and join the writer last.
 
-- Run the built SONIC v1.1 controller during active MuJoCo control.
-- Exercise both `O` and `SIGINT` paths.
-- Verify graceful shutdown logs and absence of a surviving controller process.
-- Capture the command, log, manifest, timestamps, and outcome as evidence.
+If another thread hangs, the writer continues safe publication. The supervisor reports teardown failure but does not kill the controller automatically.
 
-## Repository Integration
+For MuJoCo, the safe handoff is the independent observer confirmation described below. For real hardware, the current protocol has no actuator acknowledgement or documented command-source handoff. Therefore the controller must continue publishing damping until an operator confirms either the physical hardware E-stop or a separately validated Unitree damp-mode takeover. Real process exit without one of those confirmations is not approved by this design.
 
-Implementation will be isolated from the dirty primary workspace. It will import only the directly required pending integration artifacts: the official GR00T-WBC submodule pin, the existing v1.1 compatibility patch/application mechanism, and matching SONIC v1.1 deployment defaults. Dataset, training, and unrelated local changes will not be included.
+## Exact-Process Supervisor
 
-Expected top-level changes include:
+### Ownership and launch
 
-- a version-pinned graceful-signal patch under `patches/gr00t-wholebodycontrol/`;
-- an updated idempotent compatibility-patch installer;
-- a supervised real/sim launch entrypoint;
-- a dedicated emergency-stop command;
-- tests for patching, process identity, stop escalation, and scope;
-- operator documentation with exact rehearsal and real-hardware gates.
+A long-lived Linux supervisor owns the controller process. It creates a new session/process group, then the child directly `execve()`s the resolved `target/release/g1_deploy_onnx_ref` binary. `just run`, shell wrappers, command substitution, and tmux foreground-process discovery are not part of process identity.
 
-## Acceptance Criteria
+The preferred creation primitive is `clone3(CLONE_PIDFD)`, which returns the process handle atomically. A compatibility path may use `fork()` only when the child blocks on a private start-gate pipe until the parent has successfully opened and validated a pidfd; the parent releases the child to `setsid()` and `execve()` only afterward. Failure to obtain the pidfd cancels launch before exec. The supervisor retains that descriptor until terminal state.
 
-- No real-robot actuation occurs before the MuJoCo stop rehearsal passes.
-- `O`, `SIGINT`, and `SIGTERM` all reach the same damping-only `Stop()` path.
-- One documented command can stop the exact supervised deployment from another terminal.
-- The command never signals an unverified process and never automatically uses `SIGKILL`.
-- The operator receives unambiguous success or failure output.
-- A real-hardware stop rehearsal passes before Psi0 action publication is enabled.
+Stop clients communicate with the supervisor over a run-specific Unix-domain socket and provide the run UUID. Only the supervisor calls `pidfd_send_signal()` or polls for exact process exit. A serialized PID is never used as a signal handle.
+
+Tmux may display the supervisor and inherited controller terminal, but it is not an authority. The immutable pane ID is recorded for operator navigation; automated stop never uses `tmux send-keys`.
+
+### Immutable run identity
+
+Before actuation the supervisor records:
+
+- schema version and cryptographically random run UUID;
+- environment (`sim` or `real`);
+- supervisor PID, `/proc` start time, executable, SID, and PGID;
+- controller PID, `/proc` start time, SID, PGID, and resolved executable;
+- NUL-preserved argv encoded as an array and as base64 of `/proc/<pid>/cmdline`;
+- NUL-preserved selected environment entries;
+- parent ancestry with PID, start time, and executable for each entry;
+- pidfd ownership status and supervisor socket path;
+- immutable tmux session ID and pane ID, if used;
+- exclusive log path, device/inode, and starting offset zero;
+- controller, patch, executable, model, config, network-interface, and hardware hashes; and
+- lifecycle state, revision, and monotonic sequence.
+
+PID, start time, SID, PGID, executable, argv, and ancestry are re-read for audit, but the retained pidfd is the signal/exit authority. A pane mismatch is diagnostic, not permission to retarget another process.
+
+## Structured Evidence
+
+Each run gets a newly created `0700` directory and exclusive `0600` files. Reusing or appending to a previous run log is forbidden. The controller sends acknowledgements to the supervisor through a dedicated inherited file descriptor; lifecycle decisions do not grep stdout.
+
+Every JSONL acknowledgement contains:
+
+```text
+schema, run_uuid, sequence, event, reason,
+controller_monotonic_ns, supervisor_receive_monotonic_ns,
+environment, command_digest, evidence_scope
+```
+
+Required events include:
+
+- `controller_starting`;
+- `controller_running`;
+- `shutdown_requested`;
+- `damping_latched`;
+- `body_damping_published_host`;
+- `left_hand_relax_published_host`;
+- `right_hand_relax_published_host`;
+- `damping_observed_sim` when applicable;
+- `teardown_started`;
+- `writer_stopped`; and
+- `controller_exit_requested`.
+
+Sequence numbers are strictly increasing per run. Run UUID, command digest, inode, and starting offset prevent old or rotated logs from satisfying a new run. `[DEBUG] Stopping G1Deploy...` remains human-readable only and means `shutdown_requested`, never damping confirmation.
+
+For each body publish event, the digest covers all serialized motor fields and CRC. Hand events cover all serialized hand fields. On real hardware the evidence scope is `host_dds_write_only`.
+
+## Lifecycle and Idempotence
+
+The supervisor is the single manifest writer. It uses an advisory lock plus write-to-new-file, `fsync`, atomic rename, and directory `fsync` for every transition.
+
+Common states are:
+
+```text
+LAUNCHING -> RUNNING -> STOP_REQUESTED -> DAMPING_LATCHED
+```
+
+Simulation continues:
+
+```text
+DAMPING_LATCHED -> DAMPING_CONFIRMED -> EXITED_GRACEFUL
+```
+
+Real hardware continues only as far as the available evidence:
+
+```text
+DAMPING_LATCHED -> DAMPING_PUBLISHED_HOST -> HANDOFF_CONFIRMED_MANUAL
+                 -> EXITED_GRACEFUL
+```
+
+Any invalid transition, identity loss, writer/DDS failure, deadline violation, unexpected process disappearance, missing acknowledgement, or exit before required handoff produces `EXITED_ABNORMAL` or `STOP_FAILED_ACTIVE` as appropriate.
+
+Rules:
+
+- the first stop caller performs the transition; concurrent callers attach to that run and receive the same outcome;
+- only `EXITED_GRACEFUL` for the same run UUID is idempotent success;
+- a missing, partial, stale, rotated, or identity-mismatched manifest is an error, not “already stopped”;
+- startup cancellation before actuation may be graceful only when `damping_required=false` is proven;
+- abnormal evidence is moved to an immutable archive;
+- restart remains blocked until an explicit operator acknowledgement records identity, reason, and timestamp; and
+- acknowledgement never rewrites an abnormal result as graceful.
+
+`EXITED_GRACEFUL` also requires a `/proc` ancestry audit showing that no controller descendant from the recorded run remains. Discovery of a survivor is abnormal; it does not authorize a process-group signal.
+
+## Operator Stop Interface
+
+The one stop command:
+
+1. locks and reads the current manifest;
+2. verifies schema, run UUID, lifecycle, supervisor identity, socket ownership, and controller audit identity;
+3. asks the supervisor to request shutdown through the retained pidfd;
+4. waits for run-bound structured events, not text markers; and
+5. reports the environment-specific result.
+
+The manual `O` key calls the same controller `RequestShutdown("operator_o")` API. `SIGINT`, `SIGTERM`, Ctrl+C, internal safety faults, and supervisor requests converge on that API and writer latch.
+
+There is no automated `O` injection, PID-based `kill()`, process-group kill, `SIGKILL`, or fallback target search. If the supervisor or pidfd is unavailable, the command fails closed and tells the operator to use the hardware E-stop. It must not improvise a process target.
+
+In real mode, the command reports `DAMPING_PUBLISHED_HOST` distinctly and keeps the controller alive until manual handoff confirmation. It must not print “robot damped” or “safe” based only on host evidence.
+
+## Psi0 Real-Client Gate
+
+The refusing entrypoint is `real/scripts/deploy_psi0-sonic-rtc-client.sh`. It must not exec the client unless a rehearsal receipt is supplied and validates exactly.
+
+The receipt binds:
+
+- controller source revision and applied patch digests;
+- built controller executable digest;
+- supervisor/stop-tool digest;
+- SONIC encoder, decoder, observation config, planner, and robot config digests;
+- Psi0 client and checkpoint digests;
+- network interface identity;
+- robot serial/hardware identity and current boot ID;
+- approved request-to-host-publish deadline;
+- MuJoCo rehearsal run UUID and automated result;
+- real stop-rehearsal run UUID and `HANDOFF_CONFIRMED_MANUAL` evidence;
+- named operator and robot safety owner sign-off; and
+- creation time and expiry.
+
+This is an enforced check in the supported launcher and a manual operational sign-off, not a cryptographic safety boundary. Directly invoking Python can bypass it, so the design does not claim that the controller itself prevents every unauthorized VLA publisher. Documentation must state that limitation.
+
+The current launcher directly starts `psi_rtc_sonic_client.py`, and that file is absent from the pinned official checkout. The client artifact, source revision, and digest are therefore a blocking prerequisite rather than an assumed dependency.
+
+## Verification Design
+
+### Unit and static tests
+
+- all shared shutdown/start/play state uses atomics or locked snapshots;
+- all stop-producing paths call `RequestShutdown()`;
+- `sigaction` is installed before controller construction;
+- handlers perform only the `sig_atomic_t` assignment;
+- writer latch is monotonic and writer output dominates producer buffers;
+- body damping and both hand-relax messages have exact required fields;
+- no normal command can be committed or published after the latch;
+- ZMQ planner waits return promptly when stop is requested;
+- lifecycle transitions reject skips, regressions, partial data, and concurrent mutation;
+- stop tooling contains no broad or PID-only signalling path; and
+- the official real client launcher refuses absent, stale, mismatched, expired, or unsigned receipts.
+
+### Process integration matrix
+
+Exercise each request source in `STARTING`, `RUNNING`, and `TEARDOWN` where meaningful:
+
+- manual `O`;
+- terminal Ctrl+C;
+- direct `SIGINT` through pidfd;
+- direct `SIGTERM` through pidfd;
+- repeated identical signals;
+- mixed and concurrent stop calls; and
+- internal controller safety failure.
+
+Fault cases include:
+
+- PID reuse and `/proc` start-time mismatch;
+- tmux pane death, replacement, and foreground-process change;
+- supervisor death and socket replacement;
+- stale, rotated, truncated, and wrong-inode logs;
+- missing, partial, corrupt, and old-schema manifests;
+- controller exit between validation and stop request;
+- hung input callback, planner initialization, policy inference, and planner inference;
+- blocked or failed DDS publication; and
+- unrelated processes with matching names and argv prefixes.
+
+No fault case may signal a replacement or unrelated process. Abnormal state must survive restart attempts until acknowledged.
+
+### MuJoCo acceptance
+
+An independent subscriber on `rt/lowcmd`, `rt/dex3/left/cmd`, and `rt/dex3/right/cmd` records receipt timestamps and full payloads while active nonzero commands are being published.
+
+For every request source and injected hang:
+
+- body and both hands meet the configured deadline;
+- the first observed body command has all 29 `tau=0`, `q=0`, `dq=0`, `kp=0`, and `kd=8`;
+- both hands have the timeout bit set and all command fields zero;
+- every later observed command through writer shutdown remains a safe command;
+- injected input/control/planner hangs do not stop the damping writer;
+- the structured run sequence is complete and correctly scoped; and
+- pidfd observation proves exact controller exit.
+
+Latency is measured over repeated loaded-host trials. Any single hard-ceiling miss fails the receipt; averages or percentiles cannot hide a miss.
+
+### Real-hardware acceptance
+
+Real testing remains blocked until all of the following exist:
+
+- approved MuJoCo receipt for the exact artifacts;
+- clear area, physical support, tested hardware E-stop, and dedicated E-stop operator;
+- approved host-publish deadline from the robot safety owner;
+- a documented and rehearsed safe command-source handoff; and
+- manual sign-off acknowledging that host DDS publication is not actuator acknowledgement.
+
+The rehearsal runs without Psi0 action publication. A hardware E-stop or separately validated Unitree damp-mode takeover must be confirmed before the controller writer exits. Only then may the manual receipt be created. The separately reviewed short Psi0 trial may use that receipt; this document does not approve the trial itself.
+
+## Repository and Artifact Prerequisites
+
+Commit `82df10c` is not self-contained. Its branch contains neither the GR00T-WBC gitlink nor the compatibility patch mechanism. The dirty primary workspace currently shows the intended inputs, but uncommitted workspace state is not a release artifact.
+
+The prerequisite integration commit must contain and test, at minimum:
+
+- submodule URL `https://github.com/NVlabs/GR00T-WholeBodyControl.git`;
+- gitlink `c374bae5b9039cd0ee71377e654d11ce1bc69e1d`;
+- existing ZMQ compatibility patch SHA-256 `34d20ee831999b08cdfc0e7215f6cbf8e8b0ac4ee0f5691afa994eb669229a06`;
+- compatibility installer SHA-256 `234ec9536138516f7157341e9081dfa508a3388816a1a7bc1d794a0b752ddf92`; and
+- the exact, present Psi0 RTC client source and its repository commit/digest.
+
+Those hashes document the reviewed local candidates; they do not substitute for a committed prerequisite. The emergency-stop patch must be a later, separately reviewable artifact against that exact baseline. No implementation plan begins until the prerequisite commit and this revised design are independently approved.
+
+## Acceptance Criteria for Design Approval
+
+- The reviewer accepts the writer-level body and hand latch and timing semantics.
+- The reviewer accepts that only the hardware E-stop is an independent fault domain.
+- Signal installation, startup, repetition, teardown, and data-race handling are explicit.
+- Stable pidfd ownership replaces PID/tmux targeting for all automated signals.
+- Structured evidence is run-bound and distinguishes simulation observation from host-only real evidence.
+- Lifecycle locking, concurrent calls, abnormal archival, restart blocking, and idempotence are explicit.
+- The client-gate limitation is described as enforced launcher workflow plus manual sign-off, not actuator proof.
+- The complete failure and signal matrix is part of acceptance testing.
+- A prerequisite artifact commit makes the pinned controller, patch mechanism, and client source reproducible.
+- No real-robot command or implementation planning starts before a new approval verdict.
