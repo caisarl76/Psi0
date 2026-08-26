@@ -30,6 +30,8 @@ The containment contract follows the Linux kernel's [cgroup-v2 delegation and co
 
 The signal-authority contract follows [`pidfd_send_signal(2)`](https://man7.org/linux/man-pages/man2/pidfd_send_signal.2.html) and the [`kill(2)` permission rules](https://man7.org/linux/man-pages/man2/kill.2.html): a pidfd is a stable process reference, not an authorization token. The caller still needs matching credentials or `CAP_KILL` in the target's user namespace. Cross-process `/proc` inspection is treated separately because `/proc/<pid>/exe`, environment, and namespace reads are subject to [ptrace access checks](https://man7.org/linux/man-pages/man2/ptrace.2.html), including the specific rule for [`/proc/<pid>/exe`](https://man7.org/linux/man-pages/man5/proc_pid_exe.5.html).
 
+The namespace-creation contract follows [`user_namespaces(7)`](https://man7.org/linux/man-pages/man7/user_namespaces.7.html) and [`unshare(2)`](https://man7.org/linux/man-pages/man2/unshare.2.html): creating a child user namespace grants the creator a full capability set in that child, and combining `CLONE_NEWUSER` with other namespace flags creates the user namespace first. An empty bounding set and `NoNewPrivs` do not prevent that grant. This design therefore prohibits controller-created or controller-joined namespaces with a pre-execution seccomp filter; it does not claim that ordinary capability dropping is sufficient. The filter contract follows [`seccomp(2)`](https://man7.org/linux/man-pages/man2/seccomp.2.html), including architecture/ABI checks and filter inheritance across `fork()`, `clone()`, and `execve()`.
+
 ## Safety Claims and Non-Claims
 
 The design may claim only the following, with the stated evidence:
@@ -131,9 +133,10 @@ The controller child inherits the blocked mask across `execveat()`. At the first
 
 1. verifies that SIGINT and SIGTERM are blocked and leaves them blocked in the main thread and every later thread;
 2. reapplies and reads back `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE=0`, final UID/GID, and empty effective/permitted/inheritable/ambient/bounding capability sets;
-3. creates the sole controller signal thread, which verifies its inherited mask and enters the synchronous wait path;
-4. completes a preinitialized `pthread_mutex_t`/`pthread_cond_t` release/acquire startup handshake proving that the waiter is in its synchronous wait loop; and
-5. sends a fixed-size `SIGNAL_WAITER_READY` startup record over the inherited control socket.
+3. verifies `PR_GET_SECCOMP == SECCOMP_MODE_FILTER` and that the inherited read-only, fully sealed profile memfd identifies the expected filter digest, kernel build, architecture, and ABI;
+4. creates the sole controller signal thread, which verifies its inherited mask and enters the synchronous wait path;
+5. completes a preinitialized `pthread_mutex_t`/`pthread_cond_t` release/acquire startup handshake proving that the waiter is in its synchronous wait loop; and
+6. sends a fixed-size `SIGNAL_WAITER_READY` startup record over the inherited control socket.
 
 Failure at any step exits before actuation. A signal already pending across `execveat()` remains pending until the waiter consumes it. On return from `sigwaitinfo()`, the signal thread captures `t_controller_signal_wait_return` with `CLOCK_MONOTONIC_RAW` and directly calls `RequestShutdown()`; it does not communicate through a flag. Its preallocated request slot and the release/acquire coordinator transition provide inter-thread publication. The signal thread performs no DDS, filesystem persistence, formatting, or lifecycle logging.
 
@@ -141,7 +144,7 @@ The controller blocks after sending `SIGNAL_WAITER_READY`. For disposable signal
 
 The supervisor has an analogous packed, always-lock-free arm/stop atomic and exclusively owned preallocated request slots. `SupervisorTryAuthorizeArm()` and every stop ingress use release compare-and-swap with acquire readers. Stop-CLI handling and the signal-wait thread call `SupervisorRequestStop()` directly; there is no plain, volatile, or asynchronous dispatch flag. If stop wins the supervisor gate, the arm token is withheld. If arm authorization wins, every concurrent or later stop ingress still calls `pidfd_send_signal()` directly and idempotently, so a preempted first dispatcher cannot suppress delivery. This supervisor gate is fail-closed coordination, not the controller's first-actuation boundary.
 
-`SupervisorTryAuthorizeArm()` must refuse unless containment and both signal-authority probes passed, the final controller pidfd and pinned evidence match, the final controller waiter/writer are ready, and the bootstrap-helper pidfd reports exit. The supervisor may send a one-shot arm token only after that operation succeeds. Receipt of that token is not the controller linearization point. The writer calls `TryArm()` on the single controller activation atomic. A stop producer racing with it calls `RequestShutdown()` on that same atomic, so exactly one of cancellation or arming wins. `TryArm()` success is the exact first-actuation boundary: no body or hand DDS write may occur before it, and the safety writer must already be runnable. Producer threads start only after it.
+`SupervisorTryAuthorizeArm()` must refuse unless containment, namespace-prohibition policy, and both signal-authority probes passed; the final controller pidfd and pinned evidence match; the final controller waiter/writer are ready; and the bootstrap-helper pidfd reports exit. The supervisor may send a one-shot arm token only after that operation succeeds. Receipt of that token is not the controller linearization point. The writer calls `TryArm()` on the single controller activation atomic. A stop producer racing with it calls `RequestShutdown()` on that same atomic, so exactly one of cancellation or arming wins. `TryArm()` success is the exact first-actuation boundary: no body or hand DDS write may occur before it, and the safety writer must already be runnable. Producer threads start only after it.
 
 If cancellation wins, `STARTUP_CANCELLED` records `damping_required=false`, arming becomes impossible, and zero body/hand writes are required. If arming wins, later delivery of a request whose sender timestamp predates the boundary does not retroactively cancel arming: damping is required and the end-to-end deadline still begins at that earlier source timestamp. A signal during teardown leaves the latch set. Coalesced signals do not re-enter teardown.
 
@@ -231,7 +234,7 @@ For MuJoCo, the safe handoff is the independent observer confirmation described 
 
 A short-lived, root-owned, single-threaded bootstrap helper creates the security boundary and a long-lived least-privileged supervisor owns the controller thereafter. The helper blocks SIGINT/SIGTERM in the supervisor child before its `execve()`, creates the run-specific user namespace and cgroups, opens and hashes the controller executable, and launches gated controller children. The helper never signals a controller and cannot authorize publication. It passes a pidfd referring to itself to the supervisor, exits before the final arm decision, and must be observed exited through that pidfd.
 
-The preferred creation primitive is `clone3(CLONE_PIDFD | CLONE_INTO_CGROUP)`, used by the helper to atomically obtain the process handle and place each child in its designated cgroup. A compatibility path may use `fork()` only when the child blocks on a private start-gate pipe until the helper has opened and validated a pidfd and placed the still-blocked child in the cgroup. The privileged child trampoline configures the private namespaces/mounts, clears inherited privileged descriptors, drops to the controller credentials and zero capabilities, creates a new session/process group, and waits at the gate. Gate closure causes `_exit()` before controller execution. The target is executed only with `execveat()` from the pinned executable descriptor; shells, path re-resolution, `just run`, command substitution, and tmux foreground-process discovery are excluded. The helper transfers each pidfd to the final-credential supervisor over a private `SOCK_SEQPACKET` socket with `SCM_RIGHTS`. Failure at any point cancels real launch before execution.
+The preferred creation primitive is `clone3(CLONE_PIDFD | CLONE_INTO_CGROUP)`, used by the helper before the controller seccomp filter exists to atomically obtain the process handle and place each child in its designated cgroup. A compatibility path may use `fork()` only when the child blocks on a private start-gate pipe until the helper has opened and validated a pidfd and placed the still-blocked child in the cgroup. The privileged child trampoline configures the private namespaces/mounts, clears inherited privileged descriptors, drops to the controller credentials and zero capabilities in the run and ancestor user namespaces, creates a new session/process group, sets `NoNewPrivs`, installs and verifies the immutable namespace-prohibition seccomp filter defined below, and waits at the gate. Gate closure causes `_exit()` before controller execution. The target is executed only with `execveat()` from the pinned executable descriptor; shells, path re-resolution, `just run`, command substitution, and tmux foreground-process discovery are excluded. The helper transfers each pidfd to the final-credential supervisor over a private `SOCK_SEQPACKET` socket with `SCM_RIGHTS`. Failure at any point cancels real launch before execution.
 
 Stop clients communicate with the supervisor over a run-specific Unix-domain socket and provide the run UUID. Only the supervisor calls `pidfd_send_signal()` for controller processes or treats pidfd polling as safety exit evidence. The helper may use `waitid()` only to reap already-exited disposable children; it may not signal them or turn PID-based wait results into safety evidence. A serialized PID is never used as a signal handle.
 
@@ -243,13 +246,31 @@ Directory ownership and pidfd possession alone are not authority claims. Real la
 - the runtime supervisor's real/effective/saved/filesystem UID/GID values are all namespace ID 0, mapped one-to-one to dedicated host supervisor UID/GID values; it clears supplementary groups, sets `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE=0`, and retains only `CAP_KILL` in the run-specific user namespace; its effective, permitted, and bounding sets contain only `CAP_KILL`, and its ambient/inheritable sets are empty; and
 - the controller's real/effective/saved/filesystem UID/GID values are all namespace ID 1, mapped one-to-one to different dedicated host controller UID/GID values; it clears supplementary groups, sets `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE=0`, and has empty effective, permitted, inheritable, ambient, and bounding capability sets.
 
-The helper writes explicit two-entry UID/GID maps (`0 -> host supervisor`, `1 -> host controller`) and denies `setgroups` before the GID map. The supervisor and controller remain in the same host PID namespace, satisfying the pidfd caller/target PID-namespace relationship. The helper pins the run-user-namespace descriptor and its `NS_GET_PARENT` chain, and the supervisor proves after its final credential transition that its current user-namespace descriptor matches that pin. `CAP_KILL` is effective only in that run-specific user namespace: it authorizes the supervisor to signal the controller but grants no signal authority over processes in the parent/initial user namespace. The controller cannot become namespace UID 0, acquire `CAP_KILL`, access the supervisor's private sockets, or regain privilege because it has no set-ID capability, an empty bounding set, and `NoNewPrivs`.
+The helper writes explicit two-entry UID/GID maps (`0 -> host supervisor`, `1 -> host controller`) and denies `setgroups` before the GID map. The supervisor and controller remain in the same host PID namespace, satisfying the pidfd caller/target PID-namespace relationship. The helper pins the run-user-namespace descriptor and its `NS_GET_PARENT` chain, and the supervisor proves after its final credential transition that its current user-namespace descriptor matches that pin. `CAP_KILL` is effective only in that run-specific user namespace: it authorizes the supervisor to signal the controller but grants no signal authority over processes in the parent/initial user namespace. The controller cannot become namespace UID 0 or gain a capability in the run or any ancestor user namespace because it has no set-ID capability, an empty bounding set, `NoNewPrivs`, no privileged executable, and no accessible ancestor-namespace descriptor. Preventing it from gaining capabilities in a newly created child user namespace is a separate seccomp obligation defined next.
 
 The pinned supervisor and controller executables must have no set-user-ID/set-group-ID bits or file capabilities. Required controller access to GPU/device nodes, model/config files, and the DDS network interface is granted to the mapped host controller UID through explicit, recorded ACLs or ordinary file modes—not supplementary groups or capabilities. Missing or broader-than-approved access blocks launch.
 
+### Irreversible namespace-creation prohibition
+
+Real launch supports only the pinned normal x86-64 ABI and kernel build, with `CONFIG_SECCOMP_FILTER` and `CONFIG_CHECKPOINT_RESTORE` enabled. Before `execveat()`, while the controller trampoline is still single-threaded and after `PR_SET_NO_NEW_PRIVS`, it installs one classic seccomp-BPF filter in `SECCOMP_MODE_FILTER`. The filter is inherited by the controller and every later thread or child and cannot be weakened by a later filter. Its exact BPF bytecode and SHA-256 digest are build artifacts. It implements this contract:
+
+- a `seccomp_data.arch` value other than `AUDIT_ARCH_X86_64`, or any syscall number carrying `__X32_SYSCALL_BIT`, returns `ENOSYS` without executing the syscall;
+- `unshare()` and `setns()` return `EPERM` for every argument combination;
+- legacy x86-64 `clone()` returns `EPERM` when its flags contain any of `CLONE_NEWUSER`, `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWIPC`, `CLONE_NEWNET`, `CLONE_NEWPID`, `CLONE_NEWTIME`, or `CLONE_NEWUTS`, and otherwise remains available for pthreads, `fork()` wrappers, and ordinary descendants;
+- `clone3()` always returns `ENOSYS`, because classic seccomp sees only the user pointer to `struct clone_args` and cannot safely validate the pointed-to flags; and
+- `fork()` and `vfork()` remain available, but their children inherit the same filter and therefore cannot create or join namespaces.
+
+The legacy `clone()` rule loads the low 32 bits of `seccomp_data.args[0]` and rejects a nonzero intersection with one compile-time `NAMESPACE_MASK` containing every flag listed above. The filter generator takes syscall numbers and flag values from the pinned kernel UAPI headers, asserts the expected x86-64 values at build time, and emits the normal-ABI syscall-table digest. No handwritten duplicate syscall-number table is accepted.
+
+No seccomp rejection uses `SECCOMP_RET_KILL_PROCESS`; a prohibited call fails without directly killing the damping writer. The controller may install additional filters only if they are more restrictive; no runtime path may replace or remove the inherited filter. A new architecture, ABI, kernel build, namespace-creation syscall, glibc/CUDA runtime, or controller dependency invalidates the receipt and requires a syscall-table review plus a complete filtered startup and loaded-runtime rehearsal. Returning `ENOSYS` for `clone3()` is accepted only if every required runtime path demonstrably falls back to permitted non-namespace `clone()` or does not need the call.
+
+The deployment-host safety profile additionally requires `/proc/sys/kernel/unprivileged_userns_clone` to exist and read `0`. That mutable host setting is defense in depth, not the safety authority: the inherited seccomp filter remains effective if a privileged host process later changes the sysctl. The root bootstrap helper proves it can still create the one approved run user namespace before any controller trampoline exists; the final supervisor has no capability to change the sysctl. At this review, the inspected workstation reads `1`, so it cannot produce a real-hardware receipt; this design revision does not change the host setting.
+
+For every probe and controller child, the helper uses `PTRACE_SEIZE`/`PTRACE_INTERRUPT` while the single-threaded trampoline is still stopped at its pre-`execveat()` gate, dumps filter index 0 with `PTRACE_SECCOMP_GET_FILTER`, proves that exactly one filter exists and matches the pinned bytecode, then detaches with signal 0. After execution, it also verifies `PR_GET_SECCOMP == SECCOMP_MODE_FILTER` through the controller's startup record and reads the gated process's `Seccomp`/`Seccomp_filters` status fields before allowing resource loading. Failure, an extra filter, or unsupported readback blocks real launch. The controller emits no readiness event until its own process-entry check confirms seccomp mode 2. The helper records the filter, kernel build ID, normal-ABI syscall-table digest, glibc/CUDA versions, and host-policy readback in the immutable bootstrap record.
+
 The host cgroup-v2 mount must have `nsdelegate`; absence blocks real launch. The delegation root is `0750`, owned by the mapped host supervisor UID/GID. Only that identity receives write access to the delegation directory and the kernel delegation files it needs, including `cgroup.procs`, `cgroup.threads`, and `cgroup.subtree_control`; the mapped host controller identity receives none. Each per-run cgroup is created by and remains owned by the supervisor identity with directory mode `0750`, and every writable cgroup interface remains inaccessible to the controller UID/GID. The numeric UIDs/GIDs, mount ID, cgroup filesystem magic, `nsdelegate` setting, delegation-root device/inode, per-run cgroup device/inode, ownership, and effective modes are recorded before arming.
 
-The helper places the child in the run cgroup and creates a private cgroup and mount namespace rooted at that run cgroup. Inside the controller mount namespace, `/sys/fs/cgroup` exposes only the run hierarchy through a read-only, recursively bind-mounted cgroup-v2 view; the host hierarchy, ancestors, and sibling cgroups are not mounted. Mount propagation is private. The controller cannot rely on namespace visibility alone: before `execveat()` the trampoline closes every cgroup/mount-namespace descriptor not explicitly allowlisted, clears supplementary groups, sets `PR_SET_NO_NEW_PRIVS`, and drops every effective, permitted, inheritable, ambient, and bounding capability, including `CAP_SYS_ADMIN`, `CAP_SETUID`, `CAP_SETGID`, and DAC-bypass capabilities. Required writer real-time priority and memory locking are granted only through bounded `RLIMIT_RTPRIO` and `RLIMIT_MEMLOCK` values in the signed profile, not retained capabilities. Descendants inherit the same credentials, namespaces, no-new-privileges setting, capability sets, mount view, and cgroup membership.
+The helper places the child in the run cgroup and creates a private cgroup and mount namespace rooted at that run cgroup. Inside the controller mount namespace, `/sys/fs/cgroup` exposes only the run hierarchy through a read-only, recursively bind-mounted cgroup-v2 view; the host hierarchy, ancestors, and sibling cgroups are not mounted. Mount propagation is private. The controller cannot rely on namespace visibility alone: before `execveat()` the trampoline closes every cgroup/mount-namespace descriptor not explicitly allowlisted, clears supplementary groups, sets `PR_SET_NO_NEW_PRIVS`, drops every effective, permitted, inheritable, ambient, and bounding capability, including `CAP_SYS_ADMIN`, `CAP_SETUID`, `CAP_SETGID`, and DAC-bypass capabilities, and installs the namespace-prohibition filter. Required writer real-time priority and memory locking are granted only through bounded `RLIMIT_RTPRIO` and `RLIMIT_MEMLOCK` values in the signed profile, not retained capabilities. Descendants inherit the same credentials, namespace boundaries, no-new-privileges setting, capability sets, seccomp filter, mount view, and cgroup membership.
 
 These controls address both kernel migration conditions: the controller can write neither a destination `cgroup.procs` nor the common ancestor's `cgroup.procs`, and neither a destination outside the namespace nor a writable host cgroup hierarchy is reachable. `CAP_KILL` grants no cgroup or identity-changing authority. The supervisor is the only non-root runtime component permitted to migrate or enumerate the run through the host cgroup hierarchy.
 
@@ -258,18 +279,26 @@ Before `TryArm()`, the helper launches a fixed, hashed containment probe at the 
 - write themselves or one another to the run root, a child, a sibling, or an ancestor `cgroup.procs`/`cgroup.threads`;
 - create a child cgroup or make the cgroup mount writable;
 - open a host/sibling cgroup path through `/proc`, inherited descriptors, or namespace escape; and
-- use `setns()`, `unshare()`, or mount operations to obtain a different cgroup view.
+- use `setns()` or mount operations to obtain a different cgroup view.
 
-The helper inspects both live probe PIDs while it still has bootstrap authority and pins the resulting evidence. The final-credential supervisor independently verifies their membership through its owned host cgroup hierarchy and verifies the pinned namespace and mount descriptors described below. Expected failures are `EACCES`, `EPERM`, `EROFS`, or namespace `ENOENT`; an unexpected success, missing check, inherited writable cgroup descriptor, or unverifiable result blocks the arm token. The actual controller is launched through the same immutable, hashed setup routine.
+The same probe exercises the installed seccomp policy directly:
+
+- `unshare()` is called with every individual `CLONE_NEW*` flag above and with `CLONE_NEWUSER` combined with each other namespace flag; every call must return `EPERM`;
+- legacy `clone()` is called with the same individual and combined namespace flags; every call must return `EPERM` and create no child;
+- ordinary and namespace-bearing `clone3()` calls must both return `ENOSYS` and create no child;
+- `setns()` with an invalid descriptor and against every self-openable current namespace descriptor must return `EPERM`, proving rejection occurs before descriptor validity or target permissions matter; and
+- a permitted `fork()` and a permitted non-namespace `clone()` child must repeat the prohibited calls with the same results, proving filter inheritance.
+
+The helper inspects both live probe PIDs while it still has bootstrap authority and pins the resulting evidence. The final-credential supervisor independently verifies their membership through its owned host cgroup hierarchy and verifies the pinned namespace, mount, and seccomp descriptors described below. Expected cgroup/mount failures are `EACCES`, `EPERM`, `EROFS`, or namespace `ENOENT`; seccomp calls must return the exact errors above. An unexpected success, wrong errno, created namespace/child, missing check, inherited writable cgroup descriptor, filter mismatch, or unverifiable result blocks the arm token. The actual controller is launched through the same immutable, hashed setup routine and filter.
 
 Before the helper may launch the final controller, signal authority is tested from the supervisor's final runtime credentials:
 
-1. the helper launches an exact controller executable in a disposable pre-arm run using the final controller UID/GID, user/PID namespaces, blocked signal mask, capabilities, and `NoNewPrivs` settings;
+1. the helper launches an exact controller executable in a disposable pre-arm run using the final controller UID/GID, user/PID namespaces, blocked signal mask, capabilities, `NoNewPrivs`, and seccomp-filter settings;
 2. after `SIGNAL_WAITER_READY`, the runtime supervisor calls `pidfd_send_signal(pidfd, SIGINT, nullptr, 0)`, and the child must report the matching `sigwaitinfo()` signal plus supervisor `si_pid`/`si_uid`, transition to `STARTUP_CANCELLED`, perform zero DDS writes, and exit;
 3. the test repeats with a fresh exact controller child and SIGTERM; and
 4. only after both deliveries succeed does the helper launch the final controller from the same pinned executable and immutable setup routine, transfer its pidfd, and exit.
 
-The signal calls in steps 2 and 3 must be made by the long-lived supervisor after it has the exact final UID/GID, user namespace, `CAP_KILL`-only capability sets, `NoNewPrivs`, scheduling, affinity, and memory-lock configuration. The second call is exactly `pidfd_send_signal(pidfd, SIGTERM, nullptr, 0)`. Runtime code permits only SIGINT and SIGTERM with `info=nullptr` and `flags=0`. A bootstrap-originated call, matching PID without pidfd, `EPERM`, wrong `si_pid`/`si_uid`, missing cancellation event, or helper survival blocks arming. The preflight results bind the executable/configuration hashes, user/PID namespace inode, UID/GID maps, boot ID, and runtime-supervisor credential digest used by the final run.
+The signal calls in steps 2 and 3 must be made by the long-lived supervisor after it has the exact final UID/GID, user namespace, `CAP_KILL`-only capability sets, `NoNewPrivs`, scheduling, affinity, and memory-lock configuration. The second call is exactly `pidfd_send_signal(pidfd, SIGTERM, nullptr, 0)`. Runtime code permits only SIGINT and SIGTERM with `info=nullptr` and `flags=0`. A bootstrap-originated call, matching PID without pidfd, `EPERM`, wrong `si_pid`/`si_uid`, missing cancellation event, seccomp mismatch, or helper survival blocks arming. The preflight results bind the executable/configuration hashes, user/PID namespace inode, UID/GID maps, seccomp/kernel/ABI profile, boot ID, and runtime-supervisor credential digest used by the final run.
 
 Each disposable child has a fresh preflight UUID and exclusive evidence stream. The final run manifest links both UUIDs and their digests, but preflight lifecycle events can never satisfy final-controller readiness or damping requirements and cannot be reused across a boot.
 
@@ -283,7 +312,7 @@ Cross-UID `/proc` reads are not a runtime dependency. Before the helper exits an
 - the pinned executable descriptor's device, inode, size, mode, empty file-capability xattr, and content digest; and
 - the controller's parent ancestry and the outer/nested PTY descriptors.
 
-The helper transfers the controller pidfd, read-only executable descriptor, namespace descriptors, cgroup directory descriptor, PTY descriptors, and immutable bootstrap record to the supervisor. Descriptor numbers are not identity; `fstat()` device/inode values and content digests are. The controller receives only its allowlisted control/PTY/DDS resources and receives no cgroup, namespace, supervisor-socket, or helper descriptor.
+The helper transfers the controller pidfd, read-only executable descriptor, namespace descriptors, cgroup directory descriptor, PTY descriptors, and immutable bootstrap record to the supervisor. Descriptor numbers are not identity; `fstat()` device/inode values and content digests are. The controller receives only its allowlisted control/PTY/DDS resources and the read-only, fully sealed seccomp-profile memfd; it receives no cgroup, namespace, supervisor-socket, or helper descriptor.
 
 After the helper exits, the supervisor is allowed to rely only on pidfd polling/signalling, its owned cgroup hierarchy, `fstat()`/rehashing of pinned descriptors, its own files/sockets, and run-bound controller events. It does not retain `CAP_SYS_PTRACE` and does not promise to re-read `/proc/<controller>/exe`, `environ`, `cmdline`, namespace symlinks, or ancestry. Any such post-drop read is diagnostic only; denial is expected and cannot invalidate the pinned evidence or silently weaken a check.
 
@@ -310,7 +339,7 @@ Before actuation the supervisor records:
 - pinned executable descriptor device/inode/size/digest and the fact that it is the sole `execveat()` source;
 - NUL-preserved argv and selected environment arrays constructed before execution;
 - controller pidfd ownership plus pinned user/cgroup/mount/PID namespace and cgroup-directory descriptor identities;
-- exact run-specific UID/GID maps, supervisor `CAP_KILL`-only sets, controller empty capability sets, `NoNewPrivs`, and signal-authority preflight results;
+- exact run-specific UID/GID maps, supervisor `CAP_KILL`-only sets, controller empty capability sets in the run/ancestor user namespaces, `NoNewPrivs`, seccomp bytecode/digest/readback, kernel/ABI/host-policy profile, and signal-authority preflight results;
 - per-run cgroup path and supervisor socket path;
 - outer tmux PTY and nested controller PTY device/inode and foreground PGIDs;
 - immutable tmux session ID and pane ID, if used;
@@ -346,6 +375,7 @@ Required events include:
 - `signal_authority_sigint_verified`;
 - `signal_authority_sigterm_verified`;
 - `final_controller_pidfd_received`;
+- `controller_seccomp_verified`;
 - `bootstrap_exited`;
 - `controller_starting`;
 - `signal_waiter_ready`;
@@ -379,14 +409,15 @@ LAUNCHING_SIGNALS_BLOCKED -> SUPERVISOR_SIGNAL_WAITER_READY
                            -> CONTAINMENT_VERIFIED
                            -> SIGNAL_AUTHORITY_VERIFIED
                            -> FINAL_CONTROLLER_LAUNCHED
-                           -> SIGNAL_WAITER_READY -> BOOTSTRAP_EXITED
+                           -> SIGNAL_WAITER_READY -> CONTROLLER_SANDBOX_VERIFIED
+                           -> BOOTSTRAP_EXITED
                            -> RESOURCES_LOADING -> SAFETY_WRITER_READY
                            -> PUBLICATION_ARMED -> RUNNING
                            -> STOP_REQUESTED -> DAMPING_LATCHED
 
 LAUNCHING_SIGNALS_BLOCKED/SUPERVISOR_SIGNAL_WAITER_READY/CONTAINMENT_VERIFIED/
 SIGNAL_AUTHORITY_VERIFIED/FINAL_CONTROLLER_LAUNCHED/SIGNAL_WAITER_READY/
-BOOTSTRAP_EXITED/RESOURCES_LOADING/SAFETY_WRITER_READY
+CONTROLLER_SANDBOX_VERIFIED/BOOTSTRAP_EXITED/RESOURCES_LOADING/SAFETY_WRITER_READY
                            -> STARTUP_CANCELLED -> EXITED_GRACEFUL
 ```
 
@@ -451,7 +482,7 @@ The receipt binds:
 - robot serial/hardware identity and current boot ID;
 - approved source-to-host-publish and MuJoCo-observation deadlines;
 - writer, controller signal-waiter, and supervisor stop-ingress scheduling/priority, CPU affinity, memory-locking, cpuset/IRQ isolation, and stress profile;
-- run-specific UID/GID maps; supervisor `CAP_KILL`-only user-namespace authority; controller empty capability sets; `NoNewPrivs`; cgroup-v2 delegation/mount/namespace identity; interface ownership/modes; and containment-probe result;
+- run-specific UID/GID maps; supervisor `CAP_KILL`-only user-namespace authority; controller empty capability sets in the run/ancestor namespaces; `NoNewPrivs`; exact seccomp bytecode/digest/readback; pinned kernel, architecture, ABI, syscall-table, glibc/CUDA and host-userns-policy values; cgroup-v2 delegation/mount/namespace identity; interface ownership/modes; and containment-probe result;
 - SIGINT/SIGTERM final-credential pidfd preflight records and pinned executable/namespace/cgroup evidence;
 - per-run cgroup and outer/nested PTY topology results;
 - MuJoCo rehearsal run UUID and automated result;
@@ -474,7 +505,10 @@ The current launcher directly starts `psi_rtc_sonic_client.py`, and that file is
 - the packed activation atomic is always lock-free and its release/acquire publication makes the winning request record visible;
 - exhaustive arm/stop race tests prove one linearization order: cancel-win produces zero writes, while arm-win requires timely damping even when the source timestamp predates arming;
 - the runtime supervisor has exactly `CAP_KILL` in the recorded run user namespace, no capability in the parent namespace, and no `kill()`, `tgkill()`, process-group, or PID-only signal call site;
-- the controller cannot change to supervisor UID/GID, acquire any capability, access supervisor/helper sockets, or access writable cgroup delegation files;
+- the controller cannot change to supervisor UID/GID, gain a capability in the run or an ancestor user namespace, access supervisor/helper sockets, or access writable cgroup delegation files;
+- the exact pre-`execveat()` seccomp filter is present on the controller and every descendant: alternate architectures/x32 and all `clone3()` calls return `ENOSYS`, `unshare()`/`setns()` return `EPERM`, and legacy `clone()` rejects every individual or combined namespace flag while allowing the required non-namespace thread/process forms;
+- direct, libc-wrapper, forked-child, raw-syscall, and adversarial mixed-flag tests prove that no controller path can create or join a child user, mount, cgroup, PID, network, IPC, UTS, or time namespace;
+- filtered full startup, CUDA/TensorRT initialization, inference, planner, input, DDS, evidence, shutdown, and lazy-thread-creation paths complete on the pinned kernel/glibc/CUDA stack without relying on `clone3()`;
 - SIGINT and SIGTERM are each delivered through pidfd to a fresh exact controller preflight child by the final-credential supervisor, producing `STARTUP_CANCELLED` and zero DDS writes;
 - post-helper audit uses only pinned descriptors, pidfd, owned cgroup files, and run-bound evidence; tests deny cross-UID `/proc` reads and prove no safety result depends on them;
 - no body or hand DDS write occurs before `PUBLICATION_ARMED` and the safety writer is already ready at that transition;
@@ -486,7 +520,7 @@ The current launcher directly starts `psi_rtc_sonic_client.py`, and that file is
 - evidence queue saturation, EPIPE, SIGPIPE, and supervisor death cannot block or terminate the writer;
 - ZMQ planner waits return promptly when stop is requested;
 - lifecycle transitions reject skips, regressions, partial data, and concurrent mutation;
-- the controller and its probe descendant cannot write any reachable `cgroup.procs`/`cgroup.threads`, reach a host/sibling hierarchy, remount cgroup v2, or gain namespace/capability privilege;
+- the controller and its probe descendant cannot write any reachable `cgroup.procs`/`cgroup.threads`, reach a host/sibling hierarchy, remount cgroup v2, create/join another namespace, or gain capability in the run/ancestor user namespaces;
 - per-run cgroup membership survives child reparenting and must be empty for graceful exit;
 - stop tooling contains no broad or PID-only signalling path; and
 - the official real client launcher refuses absent, stale, mismatched, expired, or unsigned receipts.
@@ -521,7 +555,7 @@ Fault cases include:
 - blocked or failed DDS publication;
 - evidence queue saturation, socket backpressure, EPIPE, and log/manifest `fsync` delay;
 - descendant fork, reparent, and attempted cgroup escape;
-- mismatched UID/GID maps, missing or parent-namespace `CAP_KILL`, nonzero controller capability, `pidfd_send_signal()` `EPERM`, surviving helper, a runtime path that requires ptrace-gated `/proc` access, writable cgroup mount, inherited cgroup descriptor, failed namespace isolation, and containment/signal-probe deception or timeout; and
+- mismatched UID/GID maps, missing or parent-namespace `CAP_KILL`, nonzero controller capability in the run/ancestor namespaces, `pidfd_send_signal()` `EPERM`, surviving helper, a runtime path that requires ptrace-gated `/proc` access, missing/mismatched seccomp filter, wrong architecture or x32 syscall attempt, namespace-bearing `clone()` acceptance, any `unshare()`/`setns()` acceptance, `clone3()` execution instead of `ENOSYS`, required runtime failure without `clone3()`, changed kernel/syscall table/glibc/CUDA profile, writable cgroup mount, inherited cgroup descriptor, failed namespace isolation, and containment/signal-probe deception or timeout; and
 - unrelated processes with matching names and argv prefixes.
 
 No fault case may signal a replacement or unrelated process. Abnormal state must survive restart attempts until acknowledged.
@@ -559,6 +593,7 @@ Real testing remains blocked until all of the following exist:
 - clear area, physical support, tested hardware E-stop, and dedicated E-stop operator;
 - approved host-publish deadline from the robot safety owner;
 - current-boot SIGINT/SIGTERM preflight evidence from the final-credential `CAP_KILL`-only supervisor plus helper-exit confirmation;
+- exact seccomp readback and namespace-attempt evidence on the pinned kernel/ABI/runtime stack, with `/proc/sys/kernel/unprivileged_userns_clone=0` recorded;
 - verified writer scheduling, affinity, memory-locking, cgroup, PTY, and resource-isolation receipt fields;
 - a documented and rehearsed safe command-source handoff; and
 - manual sign-off acknowledging that host DDS publication is not actuator acknowledgement.
@@ -592,7 +627,8 @@ Those hashes document the reviewed local candidates; they do not substitute for 
 - Writer scheduling and resource isolation are verified, and the 10 ms ceiling is described only as measured acceptance.
 - Dex3 mode bytes and both hand-topic handoff semantics are exact.
 - Lifecycle locking, concurrent calls, abnormal archival, restart blocking, and idempotence are explicit.
-- Distinct credentials, inaccessible delegation/common-ancestor interfaces, a read-only namespaced cgroup view, zero controller capabilities, and pre-arm escape probes establish per-run cgroup containment; ownership alone is not evidence.
+- Distinct credentials, inaccessible delegation/common-ancestor interfaces, a read-only namespaced cgroup view, zero controller capabilities in the run/ancestor user namespaces, the namespace-prohibition filter, and pre-arm escape probes establish per-run cgroup containment; ownership alone is not evidence.
+- A pre-`execveat()`, inherited and read-back seccomp filter prohibits `unshare()`, `setns()`, namespace-bearing legacy `clone()`, and all `clone3()` calls; filtered startup and loaded-runtime tests prove the pinned stack remains functional.
 - Pinned pre-helper-exit evidence replaces ptrace-gated cross-UID `/proc` re-reads without granting `CAP_SYS_PTRACE`.
 - The client-gate limitation is described as enforced launcher workflow plus manual sign-off, not actuator proof.
 - The complete failure and signal matrix is part of acceptance testing.
