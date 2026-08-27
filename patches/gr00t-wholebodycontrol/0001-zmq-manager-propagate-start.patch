@@ -1,0 +1,18 @@
+diff --git a/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp b/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp
+index 6917e59..4267af2 100644
+--- a/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp
++++ b/gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp
+@@ -371,6 +371,13 @@ class ZMQManager : public InputInterface {
+       } else {
+         // Streamed motion mode: delegate to pose interface
+         if (pose_interface_) {
++          // Command messages are owned by ZMQManager, so propagate a start
++          // request before delegating. ZMQEndpointInterface only sees pose
++          // messages and cannot observe the manager's command topic itself.
++          if (start_control_ && !operator_state.start) {
++            operator_state.start = true;
++            reinitialize_heading = true;
++          }
+           pose_interface_->handle_input(motion_reader, current_motion, current_frame,
+                                        operator_state, reinitialize_heading,
+                                        heading_state_buffer,

@@ -1,0 +1,10 @@
+{
+  "artifact": "psi_rtc_sonic_client.py",
+  "source_repository": "https://github.com/physical-superintelligence-lab/GR00T-WholeBodyControl.git",
+  "source_commit": "d40376994ff094787591ab76a691c50b8e131786",
+  "source_path": "psi_rtc_sonic_client.py",
+  "sha256": "fe555caa6aa91bca350edf3fec71064532da4c7e3cb484ea2b2ab7ac0dc3726e",
+  "license": "Apache-2.0",
+  "license_source": "https://github.com/physical-superintelligence-lab/GR00T-WholeBodyControl/blob/d40376994ff094787591ab76a691c50b8e131786/LICENSE",
+  "future_pythonpath": "third_party/GR00T-WholeBodyControl"
+}
