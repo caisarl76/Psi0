@@ -74,6 +74,8 @@ The prerequisite integration preserves the reviewed patch and installer byte-for
 
 `real/SONIC/vendor/psi_rtc_sonic_client.py` is a byte-for-byte copy of the file in the PSI fork. It is not reformatted, renamed internally, patched, or given a local license header because any byte change would invalidate the reviewed digest.
 
+The immutable upstream bytes contain one whitespace diagnostic at exactly `real/SONIC/vendor/psi_rtc_sonic_client.py:284`: the line contains sixteen spaces and no other content. For the pinned SHA-256 `fe555caa6aa91bca350edf3fec71064532da4c7e3cb484ea2b2ab7ac0dc3726e`, the sole accepted `git diff --check` stdout is exactly `real/SONIC/vendor/psi_rtc_sonic_client.py:284: trailing whitespace.\n+                \n` (sixteen spaces follow `+`), stderr is empty, and the exit status is `2`. This is a single-artifact identity exception, not a general whitespace waiver. The client remains byte-for-byte unchanged, no `.gitattributes` suppression is added, and any other whitespace diagnostic fails verification.
+
 The adjacent JSON provenance record contains these exact fields:
 
 ```json
@@ -188,9 +190,17 @@ sha256sum \
   patches/gr00t-wholebodycontrol/0001-zmq-manager-propagate-start.patch \
   scripts/setup/apply_gr00t_v1_1_compat.sh \
   real/SONIC/vendor/psi_rtc_sonic_client.py
-git diff --check
+LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  git -c core.attributesFile=/dev/null \
+      -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab \
+      diff --no-color --no-ext-diff --no-textconv --check -- . \
+      ':(exclude)real/SONIC/vendor/psi_rtc_sonic_client.py'
 git status --short
 ```
+
+Before the artifact commit, all eight artifact paths are staged and `git diff --cached --check` runs with only `real/SONIC/vendor/psi_rtc_sonic_client.py` excluded. Before either staged whitespace check, `git check-attr --cached whitespace diff -- <all eight exact artifact paths>` must report the exact interleaved ordered pair `<path>: whitespace: unspecified` then `<path>: diff: unspecified` for every path; no artifact path is excluded from this attribute gate. Explicit conditional failures reject any status other than `0`, any stderr, or any extra, missing, reordered, or changed stdout line. This proves that neither repository `.gitattributes` nor `$GIT_DIR/info/attributes` suppresses diagnostics or selects a diff driver. Every whitespace command fixes `LC_ALL=C`, disables system and global Git configuration, sets `GIT_ATTR_NOSYSTEM=1`, disables the global attributes file while retaining repository configuration and repository `.gitattributes`, explicitly sets `core.whitespace=blank-at-eol,blank-at-eof,space-before-tab`, and disables color, external diff drivers, and text conversion. A separate client-only staged check, executed by the designated Python 3.10 interpreter with `-I`, must return status `2`, the one exact stdout diagnostic above, and empty stderr; the staged blob must have the pinned SHA-256. The Python gate uses explicit conditional failures rather than assertions and supplies a minimal deterministic subprocess environment. Any mismatch or additional diagnostic fails the gate.
+
+After the artifact commit, the same exact eight-path, two-attribute `--cached` gate runs before both committed-tree whitespace checks. The equivalently deterministic path-excluded command then checks `HEAD^..HEAD`, with only `real/SONIC/vendor/psi_rtc_sonic_client.py` excluded. A separate client-only `HEAD^..HEAD` check under the same environment and Git options must reproduce the same status, exact stdout bytes, and empty stderr, and `git show HEAD:real/SONIC/vendor/psi_rtc_sonic_client.py` must hash to the pinned digest. This commit-range verification replaces `git show --check`; it does not weaken the tests, compilation check, hash checks, or exact eight-path commit requirement.
 
 No test command launches the real client or controller.
 
@@ -206,6 +216,7 @@ After merge, reviewers verify that the artifact branch is an ancestor of `origin
 - The patch and installer bytes match their reviewed digests.
 - Applying the exact patch to the clean pinned object produces the reviewed header digest.
 - The vendored client bytes and provenance metadata match their reviewed source.
+- The sole upstream whitespace diagnostic is bound to the exact vendored path, line `284`, pinned digest, exit status, stdout bytes, and empty stderr; every other diagnostic is rejected.
 - The client source remains unmodified and is never imported or executed by prerequisite tests.
 - The supported launcher is the exact unconditional refusal, exits nonzero, and cannot reach Python or sockets.
 - Direct Python invocation remains technically possible, unsupported, and operationally prohibited; the refusal is not represented as a cryptographic or sandbox boundary.

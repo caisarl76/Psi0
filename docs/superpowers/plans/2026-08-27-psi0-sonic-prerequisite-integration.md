@@ -270,15 +270,23 @@ Expected: collection succeeds and tests fail because the GR00T gitlink, reviewed
 Run:
 
 ```bash
-git submodule add -b main \
+git submodule add -f -b main \
   https://github.com/NVlabs/GR00T-WholeBodyControl.git \
   third_party/GR00T-WholeBodyControl
 git -C third_party/GR00T-WholeBodyControl checkout --detach \
   c374bae5b9039cd0ee71377e654d11ce1bc69e1d
-git add .gitmodules third_party/GR00T-WholeBodyControl
+git add .gitmodules
+# .gitignore ignores third_party/; force-add only the verified gitlink path.
+git add -f -- third_party/GR00T-WholeBodyControl
+expected_gr00t_gitlink=$'160000 c374bae5b9039cd0ee71377e654d11ce1bc69e1d 0\tthird_party/GR00T-WholeBodyControl'
+actual_gr00t_gitlink="$(git ls-files --stage -- third_party/GR00T-WholeBodyControl)"
+if [[ "${actual_gr00t_gitlink}" != "${expected_gr00t_gitlink}" ]]; then
+  printf 'unexpected GR00T-WBC gitlink entry: %q\n' "${actual_gr00t_gitlink}" >&2
+  exit 1
+fi
 ```
 
-Expected: `.gitmodules` uses the official URL and `git ls-files --stage` reports mode `160000` with the exact object ID. Do not apply the patch in this checkout.
+Expected: `.gitmodules` uses the official URL and the immediate index assertion accepts exactly one mode-`160000` entry at `c374bae5b9039cd0ee71377e654d11ce1bc69e1d`, stage `0`, and the exact GR00T-WBC path. Both `git submodule add -f` and the later `git add -f` are necessary because `.gitignore` ignores `third_party/`; each force operation is scoped only to the exact `third_party/GR00T-WholeBodyControl` path. Do not apply the patch in this checkout; retain the pinned-checkout and cleanliness checks in Step 4.
 
 - [ ] **Step 2: Add the byte-identical reviewed patch**
 
@@ -494,12 +502,16 @@ Run:
 
 ```bash
 git -C third_party/GR00T-WholeBodyControl status --short --untracked-files=all
-git diff --check
+LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  git -c core.attributesFile=/dev/null \
+      -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab \
+      diff --no-color --no-ext-diff --no-textconv --check -- . \
+      ':(exclude)real/SONIC/vendor/psi_rtc_sonic_client.py'
 git diff --submodule=short --stat
 git status --short
 ```
 
-Expected: the submodule status is empty. Parent status contains only the eight approved artifact paths; there are no generated files.
+Expected: the submodule status and path-excluded whitespace check are empty. Parent status contains only the eight approved artifact paths; there are no generated files. The vendored client is excluded here only because its exact upstream bytes contain the separately checked line-`284` diagnostic described in Step 4. No `.gitattributes` suppression or byte normalization is permitted.
 
 - [ ] **Step 4: Stage exactly the artifact paths and inspect the index**
 
@@ -508,19 +520,104 @@ Run:
 ```bash
 git add \
   .gitmodules \
-  third_party/GR00T-WholeBodyControl \
   patches/gr00t-wholebodycontrol/0001-zmq-manager-propagate-start.patch \
   scripts/setup/apply_gr00t_v1_1_compat.sh \
   real/SONIC/vendor/psi_rtc_sonic_client.py \
   real/SONIC/vendor/psi_rtc_sonic_client.provenance.json \
   real/scripts/deploy_psi0-sonic-rtc-client.sh \
   tests/test_sonic_prerequisite_artifacts.py
-git diff --cached --check
+# .gitignore ignores third_party/; force-add only the already verified gitlink.
+git add -f third_party/GR00T-WholeBodyControl
 git diff --cached --name-status
 git ls-files --stage third_party/GR00T-WholeBodyControl
+
+/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -I - <<'PY'
+import hashlib
+import os
+import subprocess
+
+client = "real/SONIC/vendor/psi_rtc_sonic_client.py"
+artifacts = [
+    ".gitmodules",
+    "third_party/GR00T-WholeBodyControl",
+    "patches/gr00t-wholebodycontrol/0001-zmq-manager-propagate-start.patch",
+    "scripts/setup/apply_gr00t_v1_1_compat.sh",
+    client,
+    "real/SONIC/vendor/psi_rtc_sonic_client.provenance.json",
+    "real/scripts/deploy_psi0-sonic-rtc-client.sh",
+    "tests/test_sonic_prerequisite_artifacts.py",
+]
+expected = b"real/SONIC/vendor/psi_rtc_sonic_client.py:284: trailing whitespace.\n+                \n"
+expected_sha256 = "fe555caa6aa91bca350edf3fec71064532da4c7e3cb484ea2b2ab7ac0dc3726e"
+git_prefix = [
+    "git",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.whitespace=blank-at-eol,blank-at-eof,space-before-tab",
+]
+git_env = {
+    "PATH": os.environ["PATH"],
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+}
+attr_result = subprocess.run(
+    git_prefix + ["check-attr", "--cached", "whitespace", "diff", "--", *artifacts],
+    check=False,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+)
+expected_attr_stdout = b"".join(
+    (
+        f"{path}: whitespace: unspecified\n"
+        f"{path}: diff: unspecified\n"
+    ).encode("utf-8")
+    for path in artifacts
+)
+if attr_result.returncode != 0:
+    raise SystemExit(f"attribute gate returned {attr_result.returncode}, expected 0")
+if attr_result.stdout != expected_attr_stdout:
+    raise SystemExit(f"unexpected attribute gate stdout: {attr_result.stdout!r}")
+if attr_result.stderr != b"":
+    raise SystemExit(f"unexpected attribute gate stderr: {attr_result.stderr!r}")
+result = subprocess.run(
+    git_prefix
+    + ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--cached", "--check", "--", client],
+    check=False,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+)
+if result.returncode != 2:
+    raise SystemExit(f"client whitespace check returned {result.returncode}, expected 2")
+if result.stdout != expected:
+    raise SystemExit(f"unexpected client whitespace stdout: {result.stdout!r}")
+if result.stderr != b"":
+    raise SystemExit(f"unexpected client whitespace stderr: {result.stderr!r}")
+blob = subprocess.run(
+    git_prefix + ["--no-pager", "show", f":{client}"],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+).stdout
+actual_sha256 = hashlib.sha256(blob).hexdigest()
+if actual_sha256 != expected_sha256:
+    raise SystemExit(f"staged client SHA-256 {actual_sha256}, expected {expected_sha256}")
+PY
+
+LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  git -c core.attributesFile=/dev/null \
+      -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab \
+      diff --no-color --no-ext-diff --no-textconv --cached --check -- . \
+      ':(exclude)real/SONIC/vendor/psi_rtc_sonic_client.py'
 ```
 
-Expected: exactly the eight approved paths are staged, and the gitlink line begins with `160000 c374bae5b9039cd0ee71377e654d11ce1bc69e1d 0`.
+Expected: exactly the eight approved paths are staged. The forced add is required because `.gitignore` ignores `third_party/`, and it is scoped only to the exact, already verified `third_party/GR00T-WholeBodyControl` gitlink. All eight report exact interleaved `whitespace: unspecified` then `diff: unspecified` results in approved path order before either whitespace check; the path-excluded check emits nothing; the gitlink line begins with `160000 c374bae5b9039cd0ee71377e654d11ce1bc69e1d 0`; and the client-only assertion confirms exit status `2`, empty stderr, the sole exact diagnostic `real/SONIC/vendor/psi_rtc_sonic_client.py:284: trailing whitespace.\n+                \n` (sixteen spaces after `+`), and the staged-blob SHA-256. Any extra, missing, reordered, or changed attribute output, any stderr or nonzero status, or any other whitespace diagnostic fails the gate.
 
 - [ ] **Step 5: Commit the one approved artifact integration**
 
@@ -540,11 +637,94 @@ Run:
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py
-git show --check --stat --oneline HEAD
+/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -I - <<'PY'
+import hashlib
+import os
+import subprocess
+
+client = "real/SONIC/vendor/psi_rtc_sonic_client.py"
+artifacts = [
+    ".gitmodules",
+    "third_party/GR00T-WholeBodyControl",
+    "patches/gr00t-wholebodycontrol/0001-zmq-manager-propagate-start.patch",
+    "scripts/setup/apply_gr00t_v1_1_compat.sh",
+    client,
+    "real/SONIC/vendor/psi_rtc_sonic_client.provenance.json",
+    "real/scripts/deploy_psi0-sonic-rtc-client.sh",
+    "tests/test_sonic_prerequisite_artifacts.py",
+]
+expected = b"real/SONIC/vendor/psi_rtc_sonic_client.py:284: trailing whitespace.\n+                \n"
+expected_sha256 = "fe555caa6aa91bca350edf3fec71064532da4c7e3cb484ea2b2ab7ac0dc3726e"
+git_prefix = [
+    "git",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.whitespace=blank-at-eol,blank-at-eof,space-before-tab",
+]
+git_env = {
+    "PATH": os.environ["PATH"],
+    "LC_ALL": "C",
+    "LANG": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_ATTR_NOSYSTEM": "1",
+}
+attr_result = subprocess.run(
+    git_prefix + ["check-attr", "--cached", "whitespace", "diff", "--", *artifacts],
+    check=False,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+)
+expected_attr_stdout = b"".join(
+    (
+        f"{path}: whitespace: unspecified\n"
+        f"{path}: diff: unspecified\n"
+    ).encode("utf-8")
+    for path in artifacts
+)
+if attr_result.returncode != 0:
+    raise SystemExit(f"attribute gate returned {attr_result.returncode}, expected 0")
+if attr_result.stdout != expected_attr_stdout:
+    raise SystemExit(f"unexpected attribute gate stdout: {attr_result.stdout!r}")
+if attr_result.stderr != b"":
+    raise SystemExit(f"unexpected attribute gate stderr: {attr_result.stderr!r}")
+result = subprocess.run(
+    git_prefix
+    + ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--check", "HEAD^", "HEAD", "--", client],
+    check=False,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+)
+if result.returncode != 2:
+    raise SystemExit(f"client whitespace check returned {result.returncode}, expected 2")
+if result.stdout != expected:
+    raise SystemExit(f"unexpected client whitespace stdout: {result.stdout!r}")
+if result.stderr != b"":
+    raise SystemExit(f"unexpected client whitespace stderr: {result.stderr!r}")
+blob = subprocess.run(
+    git_prefix + ["--no-pager", "show", f"HEAD:{client}"],
+    check=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=git_env,
+).stdout
+actual_sha256 = hashlib.sha256(blob).hexdigest()
+if actual_sha256 != expected_sha256:
+    raise SystemExit(f"committed client SHA-256 {actual_sha256}, expected {expected_sha256}")
+PY
+
+LC_ALL=C GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+  git -c core.attributesFile=/dev/null \
+      -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab \
+      diff --no-color --no-ext-diff --no-textconv --check HEAD^ HEAD -- . \
+      ':(exclude)real/SONIC/vendor/psi_rtc_sonic_client.py'
 git diff --name-status HEAD^ HEAD
 git status --short
 ```
 
-Expected: `6 passed`; `git show --check` succeeds; the commit contains exactly the approved artifact paths; and the parent and submodule worktrees are clean.
+Expected: `6 passed`; all eight artifact paths report exact interleaved `whitespace: unspecified` then `diff: unspecified` results in approved path order before either committed-tree whitespace check; the path-excluded commit-range check emits nothing; the separate client-only check reproduces only the approved line-`284` diagnostic with status `2` and empty stderr; the committed client blob has the pinned digest; the commit contains exactly the approved artifact paths; and the parent and submodule worktrees are clean.
 
 Stop after this verification. Do not push, create a PR, merge, write the emergency-stop implementation plan, launch SONIC, run MuJoCo, change host settings, or operate a robot until separately authorized.
