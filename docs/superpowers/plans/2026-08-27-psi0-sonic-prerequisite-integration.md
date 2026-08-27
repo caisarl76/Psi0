@@ -249,7 +249,8 @@ def test_supported_launcher_refuses_without_invoking_python(tmp_path: Path) -> N
 Run:
 
 ```bash
-/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py
 ```
 
@@ -365,7 +366,8 @@ Expected: `234ec9536138516f7157341e9081dfa508a3388816a1a7bc1d794a0b752ddf92`.
 Run:
 
 ```bash
-/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py::test_official_gr00t_submodule_pin \
   tests/test_sonic_prerequisite_artifacts.py::test_reviewed_patch_and_installer_hashes \
   tests/test_sonic_prerequisite_artifacts.py::test_patch_output_from_clean_pinned_archive \
@@ -432,7 +434,8 @@ Keep it executable. Do not leave a Python command, `PYTHONPATH`, socket command,
 Run:
 
 ```bash
-/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py::test_vendored_client_identity_and_provenance \
   tests/test_sonic_prerequisite_artifacts.py::test_supported_launcher_refuses_without_invoking_python
 ```
@@ -456,7 +459,8 @@ Expected: `2 passed`. This proves only the supported launcher refuses; direct Py
 Run:
 
 ```bash
-/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py
 ```
 
@@ -533,7 +537,8 @@ Expected: one commit containing exactly the eight approved artifact paths.
 Run:
 
 ```bash
-/home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  /home/jihun/work/GR00T-lowlatency/.venv_teleop/bin/python -m pytest -q \
   tests/test_sonic_prerequisite_artifacts.py
 git show --check --stat --oneline HEAD
 git diff --name-status HEAD^ HEAD
