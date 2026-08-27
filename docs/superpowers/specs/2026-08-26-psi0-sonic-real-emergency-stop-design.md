@@ -1,10 +1,11 @@
 # Psi0 + SONIC Real-Robot Emergency Stop Design
 
-**Status:** REVISED — BLOCKED pending independent approval and the prerequisites listed below
+**Status:** APPROVED — DESIGN ONLY; implementation planning remains blocked by the repository and artifact prerequisites below
 **Date:** 2026-08-26
+**Approval recorded:** 2026-08-27, independent design review of `c801971d06355c24318a63a63aa79147f2a89dec`
 **Scope:** Safe stop of the pinned GEAR-SONIC v1.1 controller before any Psi0 real-robot action publication
 
-This revision withdraws the earlier approval claim. It is a design for review, not authorization to implement or actuate a real robot.
+This approval covers the design only. It is not authorization to begin implementation planning, change the deployment host, or actuate a real robot while the documented prerequisites remain open.
 
 ## Review Basis
 
@@ -612,7 +613,7 @@ The prerequisite integration commit must contain and test, at minimum:
 - compatibility installer SHA-256 `234ec9536138516f7157341e9081dfa508a3388816a1a7bc1d794a0b752ddf92`; and
 - the exact, present Psi0 RTC client source and its repository commit/digest.
 
-Those hashes document the reviewed local candidates; they do not substitute for a committed prerequisite. The emergency-stop patch must be a later, separately reviewable artifact against that exact baseline. No implementation plan begins until the prerequisite commit and this revised design are independently approved.
+Those hashes document the reviewed local candidates; they do not substitute for a committed prerequisite. The emergency-stop patch must be a later, separately reviewable artifact against that exact baseline. No implementation plan begins until the prerequisite integration commit is merged and verified; design approval alone does not clear that gate.
 
 ## Acceptance Criteria for Design Approval
 
@@ -633,4 +634,4 @@ Those hashes document the reviewed local candidates; they do not substitute for 
 - The client-gate limitation is described as enforced launcher workflow plus manual sign-off, not actuator proof.
 - The complete failure and signal matrix is part of acceptance testing.
 - A prerequisite artifact commit makes the pinned controller, patch mechanism, and client source reproducible.
-- No real-robot command or implementation planning starts before a new approval verdict.
+- Design approval alone authorizes neither real-robot commands nor implementation planning; the prerequisite integration commit must merge before planning, and real-hardware qualification requires the separate gates above.
