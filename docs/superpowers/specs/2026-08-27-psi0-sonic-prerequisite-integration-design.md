@@ -1,10 +1,11 @@
 # Psi0 + SONIC Prerequisite Artifact Integration Design
 
-**Status:** APPROVED FOR DESIGN-DOCUMENT CREATION ONLY; artifact implementation remains blocked pending review of this committed document
+**Status:** APPROVED — prerequisite artifact implementation may proceed within this specification
 **Date:** 2026-08-27
+**Approval recorded:** 2026-08-27, independent review of `bd79ebb60bef207c76578ad5785a25d464548eed`
 **Scope:** Make the pinned GEAR-SONIC v1.1 source, compatibility patch, installer, and Psi0 RTC client source reproducible while keeping the supported launcher unable to publish
 
-This document defines the repository prerequisite required by the approved real-robot emergency-stop design. It does not authorize artifact implementation, emergency-stop implementation planning, publication, simulation, deployment-host changes, or robot operation.
+This document defines and authorizes only the repository prerequisite required by the approved real-robot emergency-stop design. It does not authorize emergency-stop implementation planning, publication, simulation, deployment-host changes, or robot operation.
 
 ## Relationship to the Emergency-Stop Design
 
@@ -210,4 +211,4 @@ After merge, reviewers verify that the artifact branch is an ancestor of `origin
 - Direct Python invocation remains technically possible, unsupported, and operationally prohibited; the refusal is not represented as a cryptographic or sandbox boundary.
 - Future `PYTHONPATH` handling is documented but not enabled.
 - The diff contains no emergency-stop implementation, receipt validator, runtime launch, generated artifact, model, environment, simulator, host, or robot change.
-- Artifact implementation remains blocked until this committed design document receives an independent approval verdict.
+- Emergency-stop implementation planning remains blocked until the prerequisite artifact commit is merged and independently verified.
