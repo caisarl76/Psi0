@@ -2,7 +2,7 @@
 
 **Status:** APPROVED FOR DESIGN-DOCUMENT CREATION ONLY; artifact implementation remains blocked pending review of this committed document
 **Date:** 2026-08-27
-**Scope:** Make the pinned GEAR-SONIC v1.1 source, compatibility patch, installer, and Psi0 RTC client source reproducible without enabling VLA publication
+**Scope:** Make the pinned GEAR-SONIC v1.1 source, compatibility patch, installer, and Psi0 RTC client source reproducible while keeping the supported launcher unable to publish
 
 This document defines the repository prerequisite required by the approved real-robot emergency-stop design. It does not authorize artifact implementation, emergency-stop implementation planning, publication, simulation, deployment-host changes, or robot operation.
 
@@ -10,7 +10,9 @@ This document defines the repository prerequisite required by the approved real-
 
 The controlling safety contract is `docs/superpowers/specs/2026-08-26-psi0-sonic-real-emergency-stop-design.md`. That design requires a self-contained prerequisite artifact commit before emergency-stop implementation planning begins.
 
-The prerequisite commit exists only to make reviewed source inputs reproducible. It must not make the Psi0 RTC publication path operational. In particular, `real/scripts/deploy_psi0-sonic-rtc-client.sh` remains an unconditional refusal until the later emergency-stop implementation replaces it with receipt validation followed by execution.
+The prerequisite commit exists only to make reviewed source inputs reproducible. It must not make the supported Psi0 RTC publication path operational. In particular, `real/scripts/deploy_psi0-sonic-rtc-client.sh` remains an unconditional refusal until the later emergency-stop implementation replaces it with receipt validation followed by execution.
+
+Vendoring executable Python source necessarily makes direct invocation technically possible. An operator could bypass the supported launcher by constructing `PYTHONPATH` and invoking the client themselves. That path is unsupported and operationally prohibited. The refusal launcher is an enforced workflow guard, not a cryptographic, sandbox, kernel, or controller safety boundary, and this prerequisite design does not claim to prevent direct or renamed client execution.
 
 ## Reviewed Inputs
 
@@ -105,11 +107,13 @@ exit 78
 
 Exit status `78` denotes a configuration gate failure. The script performs only shell built-in `printf` and `exit` operations. It does not resolve a Python executable, change directory, set `PYTHONPATH`, import the vendored client, open ZMQ or WebSocket connections, send a start command, or publish an action.
 
+This refusal proves only that the supported launcher cannot publish at the prerequisite stage. It does not make the vendored Python source non-executable and cannot prevent an operator or another program from bypassing the launcher. Direct invocation is unsupported and operationally prohibited until the separately approved receipt-gated workflow exists.
+
 The later emergency-stop implementation may replace this exact refusal only after its receipt schema, validator, controller safety path, and qualification tests are approved and implemented. The replacement must validate the receipt before resolving or executing Python.
 
 ## Verification Design
 
-All tests are non-actuating. They must not start SONIC, connect to a robot, bind or connect a socket, or invoke the vendored client.
+All tests are non-actuating. They must not start SONIC, connect to a robot, bind or connect a socket, or invoke the vendored client. Their publication-safety claim is limited to the supported launcher; they do not claim that vendored executable source cannot be invoked directly.
 
 ### Static artifact identity
 
@@ -133,7 +137,30 @@ The patch-output test requires the pinned submodule to be initialized. It create
 6. verifies the resulting header digest is `d8d91661459765e3d634acdfec5f52a942346acaab99627ad5d65126f5cd6e00`; and
 7. verifies `git apply --reverse --check` succeeds on that output.
 
-This proves exact patch output from the clean pinned object without mutating the checked-out submodule. A separate installer test uses a disposable local clone of the initialized pinned submodule, runs the exact installer twice, verifies the first run applies the patch, verifies the second reports it already applied, and confirms the same patched-header digest. It performs no network access.
+This proves exact patch output from the clean pinned object without mutating the checked-out submodule.
+
+The separate installer test constructs a complete disposable parent fixture under the test's temporary directory. It must not symlink any fixture path to the source repository. The fixture contains:
+
+```text
+<temporary-parent>/
+├── patches/gr00t-wholebodycontrol/0001-zmq-manager-propagate-start.patch
+├── scripts/setup/apply_gr00t_v1_1_compat.sh
+└── third_party/GR00T-WholeBodyControl/
+```
+
+The test copies the byte-identical reviewed patch and installer into their required parent-relative paths and verifies both fixture hashes before execution. It creates `third_party/GR00T-WholeBodyControl` as a network-free local clone from the initialized pinned submodule, checks out detached `c374bae5b9039cd0ee71377e654d11ce1bc69e1d`, and verifies that every resolved fixture path remains below `<temporary-parent>`.
+
+Before the first installer run, the test requires the clone's `HEAD` to equal the pin, `git status --porcelain=v1 --untracked-files=all` to be empty, both staged and unstaged diffs to be empty, and `git ls-files --others --exclude-standard` to return no paths. It then invokes the installer only from the copied fixture path, so the installer's own parent-relative resolution targets the disposable clone and patch.
+
+After the first run, the test requires:
+
+- the complete `git diff --binary` byte stream to equal the reviewed patch file;
+- the only tracked change to be `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/input_interface/zmq_manager.hpp`;
+- no staged changes and no untracked files;
+- the patched header digest to equal `d8d91661459765e3d634acdfec5f52a942346acaab99627ad5d65126f5cd6e00`; and
+- stdout to equal `[gr00t-v1.1] applied streamed-mode start fix\n` and stderr to be empty.
+
+The second run must exit successfully, emit exactly `[gr00t-v1.1] streamed-mode start fix is already applied\n` on stdout with empty stderr, and leave the complete diff, changed-path set, staging state, untracked-file set, and patched-header digest byte-for-byte unchanged. The fixture performs no network access and cannot target the real checkout.
 
 ### Fail-closed launcher
 
@@ -147,7 +174,7 @@ The launcher test:
 6. requires empty stdout; and
 7. proves the sentinel was not created.
 
-The exact-text assertion establishes that no alternate absolute Python path or socket-producing command exists beyond the fake executable's observation scope.
+The exact-text assertion establishes that no alternate absolute Python path or socket-producing command exists in the supported launcher beyond the fake executable's observation scope. It makes no claim about direct invocation of the separately vendored source.
 
 ### Required verification commands
 
@@ -179,7 +206,8 @@ After merge, reviewers verify that the artifact branch is an ancestor of `origin
 - Applying the exact patch to the clean pinned object produces the reviewed header digest.
 - The vendored client bytes and provenance metadata match their reviewed source.
 - The client source remains unmodified and is never imported or executed by prerequisite tests.
-- The launcher is the exact unconditional refusal, exits nonzero, and cannot reach Python or sockets.
+- The supported launcher is the exact unconditional refusal, exits nonzero, and cannot reach Python or sockets.
+- Direct Python invocation remains technically possible, unsupported, and operationally prohibited; the refusal is not represented as a cryptographic or sandbox boundary.
 - Future `PYTHONPATH` handling is documented but not enabled.
 - The diff contains no emergency-stop implementation, receipt validator, runtime launch, generated artifact, model, environment, simulator, host, or robot change.
 - Artifact implementation remains blocked until this committed design document receives an independent approval verdict.
